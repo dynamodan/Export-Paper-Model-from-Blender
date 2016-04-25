@@ -7,4 +7,6 @@ There is also an option to set the "Plywood tab ratio" which is the ratio of the
 
 The new tabbing code also features notch depth compensation based on the edge angles.  It will make the notch shallower as the angle increases, and finally eliminate the notch altogether when the angle is acute or greater (tabs are still produced and will interlock correctly).  With this feature, your edge joints will mesh together only as deep as they should, allowing you extra glue contact (and no gap) where each tab "bottoms out" in its notch.
 
+Known issue: The resulting structure's "radius" will be bigger than the original object by the thickness of the material.  It's also completely unknown what the result is of concave shapes, if the shapes will even fit at all.  They may very well be off by one or more thicknesses of the material.  I have not yet tested to determine this.
+
 This code comes without any kind of guarantee of accuracy, or any support whatsoever.
