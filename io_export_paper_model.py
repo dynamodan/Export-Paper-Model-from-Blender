@@ -1346,6 +1346,15 @@ class AlignTab:
     """Mark in the document: plywood align tab"""
     __slots__ = ('bounds', 'center', 'rot', 'text', 'width', 'vertices')
 
+    def up(self, uvvert, length):
+        uvvert.co.x -= length * self.rot[1][0]
+        uvvert.co.y += length * self.rot[1][1]
+        
+    def dn(self, uvvert, length):
+        uvvert.co.x += length * self.rot[1][0]
+        uvvert.co.y -= length * self.rot[1][1]
+        
+
     def __init__(self, uvedge, default_width=0.005, index=None, target_island=None, notch=False):
         """Tab is directly attached to the given UVEdge"""
         first_vertex, second_vertex = (uvedge.va, uvedge.vb) if not uvedge.uvface.flipped else (uvedge.vb, uvedge.va)
@@ -1372,30 +1381,22 @@ class AlignTab:
         # v3 = UVVertex(second_vertex.co + M.Matrix(((0, -sin_90), (sin_90, 0))) * edge * tab_len / edge.length)
         # v4 = UVVertex(first_vertex.co + M.Matrix(((0, -sin_90), (sin_90, 0))) * edge * tab_len / edge.length)
         
-        v3 = UVVertex(second_vertex.co);
-        v3.co.x += tab_len * -sin;
-        v3.co.y += tab_len * cos;
+        verts = [UVVertex(second_vertex.co)]
+        self.up(verts[-1], tab_len)
         
+        verts.append(UVVertex(((first_vertex.co + second_vertex.co) / 2)))
+        self.up(verts[-1], tab_len)
         
-        v4 = UVVertex(first_vertex.co * 1);
-        v4.co.x += tab_len * -sin;
-        v4.co.y += tab_len * cos;
+        verts.append(UVVertex(verts[-1].co))
+        self.dn(verts[-1], tab_len)
         
-        v5 = UVVertex(((first_vertex.co + second_vertex.co) / 2))
+        #if v3.co != v4.co:
+        #    self.vertices = [second_vertex]+vecs+[first_vertex]
+        #else:
+        #    self.vertices = [second_vertex, vecs[0], first_vertex]
         
-
-        #v5 = UVVertex(center)
-
-        #v5.co.x = 0
-        #v5.co.y = 0
-        
-        print("v4:"+repr(v4.co))
-        print("v5:"+repr(v5.co))
-
-        if v3.co != v4.co:
-            self.vertices = [second_vertex, v3, v5, v4, first_vertex]
-        else:
-            self.vertices = [second_vertex, v3, first_vertex]
+        self.vertices = [second_vertex] + verts + [first_vertex]
+        #print(repr(self.vertices))
 
         self.width = tab_width * 0.9
         if index and target_island is not uvedge.island:
@@ -1404,8 +1405,10 @@ class AlignTab:
             self.text = index
         
         self.center = (uvedge.va.co + uvedge.vb.co) / 2 + self.rot*M.Vector((0, self.width*0.2))
-        self.bounds = [v3.co, v5.co, v4.co, self.center] if v3.co != v4.co else [v3.co, self.center]
-
+        #self.bounds = [v3.co, v5.co, v4.co, self.center] if v3.co != v4.co else [v3.co, self.center]
+        
+        self.bounds = list(o.co for o in verts) + [self.center]
+        #print("Bounds:\n"+repr(self.bounds))
 
 class NumberAlone:
     """Mark in the document: numbering inside the island denoting edges to be sticked"""
