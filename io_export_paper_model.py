@@ -199,7 +199,9 @@ class Unfolder:
 
         # after this call, all dimensions will be in meters
         self.mesh.scale_islands(unit_scale/properties.scale)
-        if properties.do_create_stickers:
+        if properties.do_create_tabs:
+            self.mesh.generate_tabs(properties.sticker_width, properties.do_create_numbers)
+        elif properties.do_create_stickers:
             self.mesh.generate_stickers(properties.sticker_width, properties.do_create_numbers)
         elif properties.do_create_numbers:
             self.mesh.generate_numbers_alone(properties.sticker_width)
@@ -238,6 +240,7 @@ class Unfolder:
 
         svg = SVG(page_size, properties.style, properties.output_margin, (properties.output_type == 'NONE'))
         svg.do_create_stickers = properties.do_create_stickers
+        svg.do_create_tabs = properties.do_create_tabs
         svg.text_size = properties.sticker_width
         svg.write(self.mesh, filepath)
 
@@ -362,6 +365,54 @@ class Mesh:
         for bpy_edge in self.data.edges:
             edge = self.edges[bpy_edge.index]
             bpy_edge.use_seam = len(edge.uvedges) > 1 and edge.is_main_cut
+
+    def generate_tabs(self, default_width, do_create_numbers=True):
+        """Add alignment tabs where they are needed."""
+        def uvedge_priority(uvedge):
+            """Retuns whether it is a good idea to tab this edge's face"""
+            # TODO: it should take into account overlaps with faces and with other tabs
+            return uvedge.uvface.face.area / sum((vb.co - va.co).length for (va, vb) in pairs(uvedge.uvface.verts))
+
+        def add_tab(uvedge, index, target_island):
+            uvedge.tab = AlignTab(uvedge, default_width, index, target_island)
+            uvedge.island.add_marker(uvedge.tab)
+
+        def add_notch(uvedge, index, target_island):
+            uvedge.tab = AlignTab(uvedge, default_width, index, target_island, True) # pass a boolean that indicates notch rather than tab
+            uvedge.island.add_marker(uvedge.tab)
+
+        for edge in self.edges.values():
+            if edge.is_main_cut and len(edge.uvedges) >= 2 and edge.vect.length_squared > 0:
+                uvedge_a, uvedge_b = edge.uvedges[:2]
+                if uvedge_priority(uvedge_a) < uvedge_priority(uvedge_b):
+                    uvedge_a, uvedge_b = uvedge_b, uvedge_a
+                target_island = uvedge_a.island
+                left_edge, right_edge = uvedge_a.neighbor_left.edge, uvedge_a.neighbor_right.edge
+                if do_create_numbers:
+                    for uvedge in [uvedge_b] + edge.uvedges[2:]:
+                        if ((uvedge.neighbor_left.edge is not right_edge or uvedge.neighbor_right.edge is not left_edge) and
+                                uvedge not in (uvedge_a.neighbor_left, uvedge_a.neighbor_right)):
+                            # it will not be clear to see that these uvedges should be tabbed together
+                            # So, create an arrow and put the index on all tabs
+                            target_island.tab_numbering += 1
+                            index = str(target_island.tab_numbering)
+                            if is_upsidedown_wrong(index):
+                                index += "."
+                            # target_island.add_marker(Arrow(uvedge_a, default_width, index))
+                            break
+                    else:
+                        # if all uvedges to be tabbed are easy to see, create no numbers
+                        index = None
+                else:
+                    index = None
+                add_tab(uvedge_a, index, uvedge_a.island)
+                add_notch(uvedge_b, index, uvedge_b.island)
+            elif len(edge.uvedges) > 2:
+                index = None
+                target_island = edge.uvedges[0].island
+            if len(edge.uvedges) > 2:
+                for uvedge in edge.uvedges[2:]:
+                    add_tab(uvedge, index, target_island)
 
     def generate_stickers(self, default_width, do_create_numbers=True):
         """Add sticker faces where they are needed."""
@@ -764,7 +815,7 @@ class Island:
         'image_path', 'embedded_image',
         'number', 'label', 'abbreviation', 'title',
         'has_safe_geometry', 'is_inside_out',
-        'sticker_numbering')
+        'sticker_numbering', 'tab_numbering')
 
     def __init__(self, face=None):
         """Create an Island from a single Face"""
@@ -782,6 +833,7 @@ class Island:
         self.is_inside_out = False  # swaps concave <-> convex edges
         self.has_safe_geometry = True
         self.sticker_numbering = 0
+        self.tab_numbering = 0
 
         if face:
             uvface = UVFace(face, self)
@@ -1153,7 +1205,7 @@ class UVEdge:
     # UVEdges are doubled as needed because they both have to point clockwise around their faces
     __slots__ = ('va', 'vb', 'island', 'uvface', 'edge',
         'min', 'max', 'bottom', 'top',
-        'neighbor_left', 'neighbor_right', 'sticker')
+        'neighbor_left', 'neighbor_right', 'sticker', 'tab')
 
     def __init__(self, vertex1: UVVertex, vertex2: UVVertex, island: Island, uvface, edge):
         self.va = vertex1
@@ -1162,6 +1214,7 @@ class UVEdge:
         self.island = island
         self.uvface = uvface
         self.sticker = None
+        self.tab = None
         self.edge = edge
 
     def update(self):
@@ -1289,6 +1342,70 @@ class Sticker:
         self.center = (uvedge.va.co + uvedge.vb.co) / 2 + self.rot*M.Vector((0, self.width*0.2))
         self.bounds = [v3.co, v4.co, self.center] if v3.co != v4.co else [v3.co, self.center]
 
+class AlignTab:
+    """Mark in the document: plywood align tab"""
+    __slots__ = ('bounds', 'center', 'rot', 'text', 'width', 'vertices')
+
+    def __init__(self, uvedge, default_width=0.005, index=None, target_island=None, notch=False):
+        """Tab is directly attached to the given UVEdge"""
+        first_vertex, second_vertex = (uvedge.va, uvedge.vb) if not uvedge.uvface.flipped else (uvedge.vb, uvedge.va)
+        edge = first_vertex.co - second_vertex.co
+        edge180 = second_vertex.co - first_vertex.co
+        tab_width = min(default_width, edge.length / 2)
+        other = uvedge.edge.other_uvedge(uvedge)  # This is the other uvedge - the tabbing target
+
+        other_first, other_second = (other.va, other.vb) if not other.uvface.flipped else (other.vb, other.va)
+        other_edge = other_second.co - other_first.co
+        # angle a is at vertex uvedge.va, b is at uvedge.vb
+        cos_a = cos_b = 0
+        sin_a = sin_b = 0.75**0.5
+        sin_90 = 0.75**0.5;
+        
+        # tab_len is the perpendicular line length
+        tab_len = (tab_width / sin_a)
+        
+        sin, cos = edge.y / edge.length, edge.x / edge.length
+        self.rot = M.Matrix(((cos, -sin), (sin, cos)))
+
+        # def __init__(self, vector, vertex=None): <-- that's the UVVertex constructor
+
+        # v3 = UVVertex(second_vertex.co + M.Matrix(((0, -sin_90), (sin_90, 0))) * edge * tab_len / edge.length)
+        # v4 = UVVertex(first_vertex.co + M.Matrix(((0, -sin_90), (sin_90, 0))) * edge * tab_len / edge.length)
+        
+        v3 = UVVertex(second_vertex.co);
+        v3.co.x += tab_len * -sin;
+        v3.co.y += tab_len * cos;
+        
+        
+        v4 = UVVertex(first_vertex.co * 1);
+        v4.co.x += tab_len * -sin;
+        v4.co.y += tab_len * cos;
+        
+        v5 = UVVertex(((first_vertex.co + second_vertex.co) / 2))
+        
+
+        #v5 = UVVertex(center)
+
+        #v5.co.x = 0
+        #v5.co.y = 0
+        
+        print("v4:"+repr(v4.co))
+        print("v5:"+repr(v5.co))
+
+        if v3.co != v4.co:
+            self.vertices = [second_vertex, v3, v5, v4, first_vertex]
+        else:
+            self.vertices = [second_vertex, v3, first_vertex]
+
+        self.width = tab_width * 0.9
+        if index and target_island is not uvedge.island:
+            self.text = "{}:{}".format(target_island.abbreviation, index)
+        else:
+            self.text = index
+        
+        self.center = (uvedge.va.co + uvedge.vb.co) / 2 + self.rot*M.Vector((0, self.width*0.2))
+        self.bounds = [v3.co, v5.co, v4.co, self.center] if v3.co != v4.co else [v3.co, self.center]
+
 
 class NumberAlone:
     """Mark in the document: numbering inside the island denoting edges to be sticked"""
@@ -1398,7 +1515,7 @@ class SVG:
 
                     data_markers, data_stickerfill, data_outer, data_convex, data_concave, data_freestyle = (list() for i in range(6))
                     for marker in island.markers:
-                        if isinstance(marker, Sticker):
+                        if (isinstance(marker, Sticker) or isinstance(marker, AlignTab)):
                             data_stickerfill.append("M {} Z".format(
                                 line_through(self.format_vertex(vertex.co, island.pos) for vertex in marker.vertices)))
                             if marker.text:
@@ -1424,6 +1541,8 @@ class SVG:
                                 size=marker.size * 1000))
                     if data_stickerfill and self.style.sticker_fill[3] > 0:
                         print("<path class='sticker' d='", rows(data_stickerfill), "'/>", file=f)
+                    else:
+                        print("self.style.sticker_fill[3]:"+str(self.style.sticker_fill[3]))
 
                     outer_edges = set(island.boundary)
                     while outer_edges:
@@ -1432,6 +1551,8 @@ class SVG:
                         while 1:
                             if uvedge.sticker:
                                 data_loop.extend(self.format_vertex(vertex.co, island.pos) for vertex in uvedge.sticker.vertices[1:])
+                            elif uvedge.tab:
+                                data_loop.extend(self.format_vertex(vertex.co, island.pos) for vertex in uvedge.tab.vertices[1:])
                             else:
                                 vertex = uvedge.vb if uvedge.uvface.flipped else uvedge.va
                                 data_loop.append(self.format_vertex(vertex.co, island.pos))
@@ -1444,14 +1565,14 @@ class SVG:
 
                     for uvedge in island.edges:
                         edge = uvedge.edge
-                        if edge.is_cut(uvedge.uvface.face) and not uvedge.sticker:
+                        if edge.is_cut(uvedge.uvface.face) and not (uvedge.sticker or uvedge.tab):
                             continue
                         data_uvedge = "M {}".format(
                             line_through(self.format_vertex(vertex.co, island.pos) for vertex in (uvedge.va, uvedge.vb)))
                         if edge.freestyle:
                             data_freestyle.append(data_uvedge)
                         # each uvedge is in two opposite-oriented variants; we want to add each only once
-                        if uvedge.sticker or uvedge.uvface.flipped != (uvedge.va.vertex.index > uvedge.vb.vertex.index):
+                        if uvedge.sticker or uvedge.tab or uvedge.uvface.flipped != (uvedge.va.vertex.index > uvedge.vb.vertex.index):
                             if edge.angle > 0.01:
                                 data_convex.append(data_uvedge)
                             elif edge.angle < -0.01:
@@ -1775,7 +1896,7 @@ class ExportPaperModel(bpy.types.Operator):
         default=0.297, soft_min=0.148, soft_max=1.189, subtype="UNSIGNED", unit="LENGTH")
     output_margin = bpy.props.FloatProperty(name="Page Margin",
         description="Distance from page borders to the printable area",
-        default=0.005, min=0, soft_max=0.1, step=0.1, subtype="UNSIGNED", unit="LENGTH")
+        default=0.000, min=0, soft_max=0.1, step=0.1, subtype="UNSIGNED", unit="LENGTH")
     output_type = bpy.props.EnumProperty(name="Textures",
         description="Source of a texture for the model",
         default='NONE', items=[
@@ -1784,9 +1905,12 @@ class ExportPaperModel(bpy.types.Operator):
             ('RENDER', "Full Render", "Render the material in actual scene illumination"),
             ('SELECTED_TO_ACTIVE', "Selected to Active", "Render all selected surrounding objects as a texture")
         ])
-    do_create_stickers = bpy.props.BoolProperty(name="Create Tabs",
-        description="Create gluing tabs around the net (useful for paper)",
+    do_create_tabs = bpy.props.BoolProperty(name="Create Plywood Tabs",
+        description="Create alignment tabs around the net (useful for CNC'd plywood shapes)",
         default=True)
+    do_create_stickers = bpy.props.BoolProperty(name="Create Paper Stickers",
+        description="Create gluing tabs around the net (useful for paper)",
+        default=False)
     do_create_numbers = bpy.props.BoolProperty(name="Create Numbers",
         description="Enumerate edges to make it clear which edges should be sticked together",
         default=True)
@@ -1896,10 +2020,11 @@ class ExportPaperModel(bpy.types.Operator):
             col.prop(self.properties, "output_size_y")
             box.prop(self.properties, "output_margin")
             col = box.column()
+            col.prop(self.properties, "do_create_tabs")
             col.prop(self.properties, "do_create_stickers")
             col.prop(self.properties, "do_create_numbers")
             col = box.column()
-            col.active = self.do_create_stickers or self.do_create_numbers
+            col.active = self.do_create_stickers or self.do_create_tabs or self.do_create_numbers
             col.prop(self.properties, "sticker_width")
 
             box.prop(self.properties, "output_type")
@@ -1951,7 +2076,7 @@ class ExportPaperModel(bpy.types.Operator):
             sub.prop(self.style, "inbg_color", text="")
             sub.prop(self.style, "inbg_width", text="Relative width")
             col = box.column()
-            col.active = self.do_create_stickers
+            col.active = self.do_create_stickers or self.do_create_tabs
             col.prop(self.style, "sticker_fill")
             box.prop(self.style, "text_color")
 
