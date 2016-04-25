@@ -59,6 +59,9 @@ import mathutils as M
 from re import compile as re_compile
 from itertools import chain
 from math import pi
+from math import floor
+from math import degrees
+import math
 
 try:
     import os.path as os_path
@@ -200,7 +203,7 @@ class Unfolder:
         # after this call, all dimensions will be in meters
         self.mesh.scale_islands(unit_scale/properties.scale)
         if properties.do_create_tabs:
-            self.mesh.generate_tabs(properties.sticker_width, properties.do_create_numbers)
+            self.mesh.generate_tabs(properties.sticker_width, properties.tab_ratio, properties.do_create_numbers)
         elif properties.do_create_stickers:
             self.mesh.generate_stickers(properties.sticker_width, properties.do_create_numbers)
         elif properties.do_create_numbers:
@@ -366,7 +369,7 @@ class Mesh:
             edge = self.edges[bpy_edge.index]
             bpy_edge.use_seam = len(edge.uvedges) > 1 and edge.is_main_cut
 
-    def generate_tabs(self, default_width, do_create_numbers=True):
+    def generate_tabs(self, default_width, tab_ratio, do_create_numbers=True):
         """Add alignment tabs where they are needed."""
         def uvedge_priority(uvedge):
             """Retuns whether it is a good idea to tab this edge's face"""
@@ -374,11 +377,11 @@ class Mesh:
             return uvedge.uvface.face.area / sum((vb.co - va.co).length for (va, vb) in pairs(uvedge.uvface.verts))
 
         def add_tab(uvedge, index, target_island):
-            uvedge.tab = AlignTab(uvedge, default_width, index, target_island)
+            uvedge.tab = AlignTab(uvedge, default_width, tab_ratio, index, target_island)
             uvedge.island.add_marker(uvedge.tab)
 
         def add_notch(uvedge, index, target_island):
-            uvedge.tab = AlignTab(uvedge, default_width, index, target_island, True) # pass a boolean that indicates notch rather than tab
+            uvedge.tab = AlignTab(uvedge, default_width, tab_ratio, index, target_island, True) # pass a boolean that indicates notch rather than tab
             uvedge.island.add_marker(uvedge.tab)
 
         for edge in self.edges.values():
@@ -1346,57 +1349,93 @@ class AlignTab:
     """Mark in the document: plywood align tab"""
     __slots__ = ('bounds', 'center', 'rot', 'text', 'width', 'vertices')
 
-    def up(self, uvvert, length):
-        uvvert.co.x -= length * self.rot[1][0]
-        uvvert.co.y += length * self.rot[1][1]
-        
-    def dn(self, uvvert, length):
-        uvvert.co.x += length * self.rot[1][0]
-        uvvert.co.y -= length * self.rot[1][1]
-        
-
-    def __init__(self, uvedge, default_width=0.005, index=None, target_island=None, notch=False):
+    def __init__(self, uvedge, default_width=0.005, tab_ratio = 3, index=None, target_island=None, notch=False):
         """Tab is directly attached to the given UVEdge"""
         first_vertex, second_vertex = (uvedge.va, uvedge.vb) if not uvedge.uvface.flipped else (uvedge.vb, uvedge.va)
         edge = first_vertex.co - second_vertex.co
-        edge180 = second_vertex.co - first_vertex.co
         tab_width = min(default_width, edge.length / 2)
         other = uvedge.edge.other_uvedge(uvedge)  # This is the other uvedge - the tabbing target
 
+        # TODO: take into account the angle between this edge and the other, and compensate tab length and
+        # notch depth based on the a specified material thickness
         other_first, other_second = (other.va, other.vb) if not other.uvface.flipped else (other.vb, other.va)
         other_edge = other_second.co - other_first.co
-        # angle a is at vertex uvedge.va, b is at uvedge.vb
-        cos_a = cos_b = 0
-        sin_a = sin_b = 0.75**0.5
-        sin_90 = 0.75**0.5;
-        
-        # tab_len is the perpendicular line length
-        tab_len = (tab_width / sin_a)
         
         sin, cos = edge.y / edge.length, edge.x / edge.length
         self.rot = M.Matrix(((cos, -sin), (sin, cos)))
 
-        # def __init__(self, vector, vertex=None): <-- that's the UVVertex constructor
-
-        # v3 = UVVertex(second_vertex.co + M.Matrix(((0, -sin_90), (sin_90, 0))) * edge * tab_len / edge.length)
-        # v4 = UVVertex(first_vertex.co + M.Matrix(((0, -sin_90), (sin_90, 0))) * edge * tab_len / edge.length)
+        verts = [UVVertex(((first_vertex.co + second_vertex.co) / 2))]
+        notchDir = 1;
+        if(notch):
+            notchDir = -1
+            
+        # read the angle between this and the other edge, and
+        # make the notch shallower by a certain percentage
+        # print("edge.angle: (cos: "+str(math.cos(uvedge.edge.angle))+"), sin: ("+str(math.sin(uvedge.edge.angle))+"), "+str(degrees(uvedge.edge.angle)))
+        notchComp = math.cos(uvedge.edge.angle)
+        if(notchComp < 0): notchComp = 0
+        notchDepth = notchDir * tab_width * abs(notchComp)
+        tabHeight = notchDir * tab_width
+        # invert if we're doing a notch:        
+        if(notch): tabHeight, notchDepth = (notchDepth, tabHeight)
         
-        verts = [UVVertex(second_vertex.co)]
-        self.up(verts[-1], tab_len)
+        tabRatio = tab_ratio;
+        if(tab_ratio < 1): tabRatio = 1
+        if(tab_ratio > 10): tabRatio = 10
         
-        verts.append(UVVertex(((first_vertex.co + second_vertex.co) / 2)))
-        self.up(verts[-1], tab_len)
+        iterations = int(floor(((edge.length - (tab_width * 2 * tabRatio)) / (tab_width * tabRatio)) / 2))
         
+        if(iterations < 0): iterations = 0 # fix wierd problem where edge is barely long enough for a tab
+        startOffset = (tab_width * tabRatio * iterations) + ((tab_width * tabRatio) / 2)
+        
+        self.lf(verts[-1], startOffset)
+        
+        # UP a tab height
         verts.append(UVVertex(verts[-1].co))
-        self.dn(verts[-1], tab_len)
+        self.up(verts[-1], tabHeight)
         
-        #if v3.co != v4.co:
-        #    self.vertices = [second_vertex]+vecs+[first_vertex]
-        #else:
-        #    self.vertices = [second_vertex, vecs[0], first_vertex]
+        # RIGHT by a tab height x ratio
+        verts.append(UVVertex(verts[-1].co))
+        self.rt(verts[-1], tab_width * tabRatio)
+        
+        # DOWN by a tab height
+        verts.append(UVVertex(verts[-1].co))
+        self.dn(verts[-1], tabHeight)
+        
+        # now iterate the number we wanted:
+        for x in range(0, iterations):
+            
+            # DOWN by notch depth:
+            verts.append(UVVertex(verts[-1].co))
+            self.dn(verts[-1], notchDepth)
+            
+            # RIGHT by a tab height x ratio
+            verts.append(UVVertex(verts[-1].co))
+            self.rt(verts[-1], tab_width * tabRatio)
+            
+            # UP by a notch depth:
+            verts.append(UVVertex(verts[-1].co))
+            self.up(verts[-1], notchDepth)
+            
+            # UP by a tab height:
+            verts.append(UVVertex(verts[-1].co))
+            self.up(verts[-1], tabHeight)
+            
+            # RIGHT by a tab height x ratio
+            verts.append(UVVertex(verts[-1].co))
+            self.rt(verts[-1], tab_width * tabRatio)
+            
+            # DOWN by a tab height
+            verts.append(UVVertex(verts[-1].co))
+            self.dn(verts[-1], tabHeight)
+            
+            # ...and do it again, if there is another iteration
+        
+        if(startOffset * 2 > edge.length): # suppress any tabs if there isn't even room for one tab:
+            print("Skipped a tab because edge.length was too short!")
+            verts = [ ]
         
         self.vertices = [second_vertex] + verts + [first_vertex]
-        #print(repr(self.vertices))
 
         self.width = tab_width * 0.9
         if index and target_island is not uvedge.island:
@@ -1405,10 +1444,26 @@ class AlignTab:
             self.text = index
         
         self.center = (uvedge.va.co + uvedge.vb.co) / 2 + self.rot*M.Vector((0, self.width*0.2))
-        #self.bounds = [v3.co, v5.co, v4.co, self.center] if v3.co != v4.co else [v3.co, self.center]
-        
         self.bounds = list(o.co for o in verts) + [self.center]
-        #print("Bounds:\n"+repr(self.bounds))
+
+    # these 4 direction movement functions are here because I'm too dumb to understand M.Vector and M.Matrix, apparently.
+    # but hey, they work!
+    def up(self, uvvert, length):
+        uvvert.co.x -= length * self.rot[1][0]
+        uvvert.co.y += length * self.rot[1][1]
+        
+    def dn(self, uvvert, length):
+        uvvert.co.x += length * self.rot[1][0]
+        uvvert.co.y -= length * self.rot[1][1]
+        
+    def lf(self, uvvert, length):
+        uvvert.co.x -= length * self.rot[0][0]
+        uvvert.co.y += length * self.rot[0][1]
+        
+    def rt(self, uvvert, length):
+        uvvert.co.x += length * self.rot[0][0]
+        uvvert.co.y -= length * self.rot[0][1]
+        
 
 class NumberAlone:
     """Mark in the document: numbering inside the island denoting edges to be sticked"""
@@ -1920,6 +1975,9 @@ class ExportPaperModel(bpy.types.Operator):
     sticker_width = bpy.props.FloatProperty(name="Tabs and Text Size",
         description="Width of gluing tabs and their numbers",
         default=0.005, soft_min=0, soft_max=0.05, step=0.1, subtype="UNSIGNED", unit="LENGTH")
+    tab_ratio = bpy.props.FloatProperty(name="Plywood tab ratio",
+        description="Ratio of tab length to width (only useful when Create Plywood Tabs is checked)",
+        default=3, min=1, soft_min=1, soft_max=10, step=1, subtype="UNSIGNED", unit="LENGTH")
     output_dpi = bpy.props.FloatProperty(name="Resolution (DPI)",
         description="Resolution of images in pixels per inch",
         default=90, min=1, soft_min=30, soft_max=600, subtype="UNSIGNED")
@@ -2029,6 +2087,7 @@ class ExportPaperModel(bpy.types.Operator):
             col = box.column()
             col.active = self.do_create_stickers or self.do_create_tabs or self.do_create_numbers
             col.prop(self.properties, "sticker_width")
+            col.prop(self.properties, "tab_ratio")
 
             box.prop(self.properties, "output_type")
             col = box.column()
